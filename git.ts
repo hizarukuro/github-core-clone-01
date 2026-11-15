@@ -7,7 +7,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { createInflate, deflateSync } from 'node:zlib';
 import {
   OBJ_TYPE_NUM, OBJ_TYPE_NAME, ZERO_OID,
   parseTree, isOid, hashObject, branchTipOf, peelToCommitOf, isAncestorOf,
@@ -18,9 +18,10 @@ import {
 
 export function pktLine(data: string | Buffer): Buffer {
   const payload = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
-  const length = payload.length + 4;
-  const header = length.toString(16).padStart(4, '0');
-  return Buffer.concat([Buffer.from(header, 'ascii'), payload]);
+  const out = Buffer.allocUnsafe(payload.length + 4);
+  out.write((payload.length + 4).toString(16).padStart(4, '0'), 0, 'ascii');
+  payload.copy(out, 4);
+  return out;
 }
 export const PKT_FLUSH = Buffer.from('0000', 'ascii');
 export const PKT_DELIM = Buffer.from('0001', 'ascii');
@@ -128,33 +129,22 @@ export function writePack(objects: readonly { type: ObjType; data: Buffer }[]): 
 
 /**
  * Inflate one zlib stream starting at `start`, returning the data and the offset just past the
- * stream. inflateSync ignores trailing bytes and throws on a truncated stream, so an
- * exponential probe plus a binary search pins the exact consumed length.
+ * stream. A zlib stream knows where its input ends: fed the rest of the pack it stops at the
+ * stream's end and reports the exact consumed count as `bytesWritten`, so one pass replaces
+ * the old probe-and-binary-search over inflateSync (whose throwing calls dominated the push
+ * workload's CPU). The stream runs on the zlib threadpool, so callers are async.
  */
-function inflateExact(buffer: Buffer, start: number): { data: Buffer; next: number } {
-  const remaining = buffer.length - start;
-  let hi = Math.min(remaining, 256);
-  let data: Buffer | null = null;
-  while (data === null) {
-    try {
-      data = inflateSync(buffer.subarray(start, start + hi));
-    } catch {
-      if (hi >= remaining) throw new Error('corrupt pack object');
-      hi = Math.min(remaining, hi * 4);
-    }
-  }
-  let lo = 1;
-  let high = hi;
-  while (lo < high) {
-    const mid = (lo + high) >> 1;
-    try {
-      inflateSync(buffer.subarray(start, start + mid));
-      high = mid;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  return { data, next: start + lo };
+function inflateStream(buffer: Buffer, start: number): Promise<{ data: Buffer; next: number }> {
+  return new Promise((resolve, reject) => {
+    const stream = createInflate();
+    const chunks: Buffer[] = [];
+    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+    stream.on('error', () => reject(new Error('corrupt pack object')));
+    stream.on('end', () => {
+      resolve({ data: Buffer.concat(chunks), next: start + stream.bytesWritten });
+    });
+    stream.end(buffer.subarray(start));
+  });
 }
 
 /** Apply a git delta to a base object. */
@@ -210,10 +200,12 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
 export interface PackEntry {
   type: ObjType;
   data: Buffer;
+  /** The object's git id (already computed during the parse; callers need not re-hash). */
+  oid: string;
 }
 
 /** Parse a whole pack into resolved objects (deltas applied against the pack or the repo). */
-export function readPack(repo: Repo, pack: Buffer): PackEntry[] {
+export async function readPack(repo: Repo, pack: Buffer): Promise<PackEntry[]> {
   if (pack.length < 12 + 20 || pack.toString('ascii', 0, 4) !== 'PACK') throw new Error('not a pack');
   const count = pack.readUInt32BE(8);
   let offset = 12;
@@ -245,25 +237,25 @@ export function readPack(repo: Repo, pack: Buffer): PackEntry[] {
         baseOffset = ((baseOffset + 1) << 7) | (back & 0x7f);
       }
       const baseIndex = indexByHeaderOffset.get(headerAt - baseOffset);
-      const { data, next } = inflateExact(pack, offset);
+      const { data, next } = await inflateStream(pack, offset);
       offset = next;
       entries.push(null);
       pending.push({ slot: index, baseIndex, delta: data });
     } else if (typeNum === 7) {
       const baseOid = pack.toString('hex', offset, offset + 20);
       offset += 20;
-      const { data, next } = inflateExact(pack, offset);
+      const { data, next } = await inflateStream(pack, offset);
       offset = next;
       entries.push(null);
       pending.push({ slot: index, baseOid, delta: data });
     } else {
       const type = OBJ_TYPE_NAME[typeNum];
       if (type === undefined) throw new Error(`pack object type ${typeNum}`);
-      const { data, next } = inflateExact(pack, offset);
+      const { data, next } = await inflateStream(pack, offset);
       offset = next;
-      const entry = { type, data };
+      const entry = { type, data, oid: hashObject(type, data) };
       entries.push(entry);
-      indexByOid.set(hashObject(type, data), entry);
+      indexByOid.set(entry.oid, entry);
     }
   }
 
@@ -278,15 +270,16 @@ export function readPack(repo: Repo, pack: Buffer): PackEntry[] {
         base = indexByOid.get(delta.baseOid) ?? null;
         if (base === null) {
           const inRepo = repo.objects.get(delta.baseOid);
-          if (inRepo !== undefined) base = { type: inRepo.type, data: inRepo.data };
+          if (inRepo !== undefined) base = { type: inRepo.type, data: inRepo.data, oid: delta.baseOid };
         }
       } else if (delta.baseIndex !== undefined) {
         base = entries[delta.baseIndex];
       }
       if (base === null) continue;
-      const entry = { type: base.type, data: applyDelta(base.data, delta.delta) };
+      const resolved = applyDelta(base.data, delta.delta);
+      const entry = { type: base.type, data: resolved, oid: hashObject(base.type, resolved) };
       entries[delta.slot] = entry;
-      indexByOid.set(hashObject(entry.type, entry.data), entry);
+      indexByOid.set(entry.oid, entry);
       remaining -= 1;
     }
   }
@@ -354,7 +347,11 @@ export function handleGit(ctx: GitContext, res: ServerResponse): void {
       return;
     }
     if (ctx.tail === '/git-receive-pack' && method === 'POST') {
-      handleReceivePack(ctx, res, repo);
+      void withReceiveLock(repo, () => handleReceivePack(ctx, res, repo)).catch(() => {
+        // A malformed body must never take the server down (repo-survives-errors).
+        if (!res.headersSent) gitError(res, 400, 'bad request\n');
+        else res.end();
+      });
       return;
     }
   } catch {
@@ -629,7 +626,27 @@ function handleFetch(ctx: GitContext, res: ServerResponse, repo: Repo, reader: P
 
 // ---------------------------------------------------------------- receive-pack (v0)
 
-function handleReceivePack(ctx: GitContext, res: ServerResponse, repo: Repo): void {
+/**
+ * Serialise receive-pack handling per repo: pack parsing is async (zlib streams), and one
+ * push's store/ref updates must stay atomic against the next push, exactly as they were when
+ * the parse was synchronous. Uncontended in the suite's sequential flows.
+ */
+const receivePackLocks = new WeakMap<Repo, Promise<void>>();
+
+function withReceiveLock(repo: Repo, fn: () => Promise<void>): Promise<void> {
+  const previous = receivePackLocks.get(repo) ?? Promise.resolve();
+  const run = previous.then(fn, fn);
+  receivePackLocks.set(
+    repo,
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return run;
+}
+
+async function handleReceivePack(ctx: GitContext, res: ServerResponse, repo: Repo): Promise<void> {
   const { forge } = ctx;
   const body = ctx.body;
   const reader = pktReader(body);
@@ -660,9 +677,9 @@ function handleReceivePack(ctx: GitContext, res: ServerResponse, repo: Repo): vo
   let unpackDetail = '';
   if (hasUpdates && packBytes.length > 0) {
     try {
-      const entries = readPack(repo, packBytes);
+      const entries = await readPack(repo, packBytes);
       for (const entry of entries) {
-        forge.putKnownObject(repo, hashObject(entry.type, entry.data), entry.type, entry.data);
+        forge.putKnownObject(repo, entry.oid, entry.type, entry.data);
       }
     } catch (err) {
       unpackOk = false;

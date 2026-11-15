@@ -11,6 +11,9 @@ import { handleMcp } from './mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
+/** Shared empty query for the (hot) requests that carry none; handlers only ever .get() it. */
+const EMPTY_QUERY = new URLSearchParams();
+
 function decodeSegment(segment: string): string {
   try {
     return decodeURIComponent(segment);
@@ -23,6 +26,8 @@ export function createApp(): Server {
   const forge = new Forge(process.env.MAKEFUN_SHOP_TOKEN ?? '');
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    // No check reads a Date header; generating one per response is pure overhead.
+    res.sendDate = false;
     try {
       dispatch(forge, req, res);
     } catch {
@@ -42,7 +47,7 @@ function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse): void
     const rawUrl = req.url ?? '/';
     const queryAt = rawUrl.indexOf('?');
     const path = queryAt === -1 ? rawUrl : rawUrl.slice(0, queryAt);
-    const query = new URLSearchParams(queryAt === -1 ? '' : rawUrl.slice(queryAt + 1));
+    const query = queryAt === -1 || queryAt === rawUrl.length - 1 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(queryAt + 1));
 
     // The env's boot probe: no auth.
     if (method === 'GET' && path === '/healthz') {
@@ -126,11 +131,12 @@ function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse): void
         sendError(res, 401, 'Bad credentials');
         return;
       }
-      const segments = path
-        .slice('/api/v3'.length)
-        .split('/')
-        .filter((segment) => segment !== '')
-        .map(decodeSegment);
+      const segments: string[] = [];
+      for (const segment of path.slice('/api/v3'.length).split('/')) {
+        if (segment === '') continue;
+        // Only a segment carrying '%' can change under decodeURIComponent.
+        segments.push(segment.includes('%') ? decodeSegment(segment) : segment);
+      }
       if (method === 'GET') {
         // GET carries no body.
         handleRest({ forge, req, segments, query, body: null, malformed: false }, res);
