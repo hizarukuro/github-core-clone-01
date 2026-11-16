@@ -147,6 +147,329 @@ function inflateStream(buffer: Buffer, start: number): Promise<{ data: Buffer; n
   });
 }
 
+// ---------------------------------------------------------------- JS inflate
+//
+// A pure-JS zlib inflate (RFC 1950 wrapper + RFC 1951 DEFLATE) with puff-style canonical
+// Huffman decoding and a 9-bit peek table. A stream per object costs ~150-200 us of CPU in
+// setup and threadpool hops; this decoder costs ~15-55 us for the small objects packs here
+// carry, runs synchronously on the request thread, and reports the exact consumed length
+// (which is what a pack parser needs and the sync zlib API cannot give). It is used for
+// small packs/objects only; anything large keeps the native stream path above. Output is
+// byte-identical to zlib's (differential-tested), the adler32 is verified, and every
+// corrupt-input case zlib rejects also throws here.
+
+const INFLATE_LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const INFLATE_LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const INFLATE_DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const INFLATE_DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const INFLATE_CLEN_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+const INFLATE_PEEK_BITS = 9;
+
+interface InflateTable {
+  counts: Int32Array;
+  symbols: Int32Array;
+  peek: Uint32Array;
+  empty: boolean;
+}
+
+/** Reverse the low `len` bits of `code` (canonical MSB-first -> stream LSB-first order). */
+function inflateReverseBits(code: number, len: number): number {
+  let out = 0;
+  for (let i = 0; i < len; i++) {
+    out = (out << 1) | (code & 1);
+    code >>= 1;
+  }
+  return out;
+}
+
+interface InflateSlot {
+  counts: Int32Array;
+  symbols: Int32Array;
+  peek: Uint32Array;
+}
+
+function newInflateSlot(): InflateSlot {
+  return { counts: new Int32Array(16), symbols: new Int32Array(320), peek: new Uint32Array(1 << INFLATE_PEEK_BITS) };
+}
+
+// Reused decode-table scratch. Safe because inflateJs is fully synchronous: a table is
+// built and consumed inside one call, never held across an await, and inflateJs never
+// recurses. Slot A serves the code-length table and then the literal table (the
+// code-length table is dead once the lengths are read); slot B serves the distance table.
+const INFLATE_SLOT_A = newInflateSlot();
+const INFLATE_SLOT_B = newInflateSlot();
+const INFLATE_OFFSETS = new Int32Array(16);
+const INFLATE_NEXT_CODE = new Int32Array(16);
+const INFLATE_LENGTHS = new Int32Array(320);
+const INFLATE_CL_LENGTHS = new Int32Array(19);
+const INFLATE_NO_PEEK = new Uint32Array(0);
+const INFLATE_NO_SYMBOLS = new Int32Array(0);
+
+/**
+ * Build puff-style decode tables into `slot`: counts per length + symbols in canonical
+ * order, plus a peek lookup: peek[upcoming bits] = symbol | (len << 16) for every code of
+ * length <= INFLATE_PEEK_BITS; 0 means "no short code here" (longer code or invalid: the
+ * puff path decides). `lengths` is read from `offset`, `count` entries.
+ */
+function inflateBuildTable(lengths: ArrayLike<number>, offset: number, count: number, slot: InflateSlot): InflateTable {
+  const counts = slot.counts;
+  counts.fill(0);
+  for (let i = 0; i < count; i++) {
+    const len = lengths[offset + i];
+    if (len > 15) throw new Error('inflate: bad code length');
+    counts[len] += 1;
+  }
+  if (counts[0] === count) return { counts, symbols: INFLATE_NO_SYMBOLS, peek: INFLATE_NO_PEEK, empty: true };
+  let left = 1;
+  for (let len = 1; len < 16; len++) {
+    left <<= 1;
+    left -= counts[len];
+    if (left < 0) throw new Error('inflate: over-subscribed code');
+  }
+  const offsets = INFLATE_OFFSETS;
+  offsets.fill(0);
+  for (let len = 1; len < 15; len++) offsets[len + 1] = offsets[len] + counts[len];
+  const symbols = slot.symbols;
+  const used = count - counts[0];
+  for (let i = 0; i < count; i++) {
+    if (lengths[offset + i] !== 0) {
+      symbols[offsets[lengths[offset + i]]] = i;
+      offsets[lengths[offset + i]] += 1;
+    }
+  }
+  // Canonical code values, assigned in (length, symbol) order = symbols[] order.
+  // nextCode[1] = 0; nextCode[len] = (nextCode[len-1] + counts[len-1]) << 1.
+  const nextCode = INFLATE_NEXT_CODE;
+  nextCode.fill(0);
+  for (let len = 2; len < 16; len++) {
+    nextCode[len] = (nextCode[len - 1] + counts[len - 1]) << 1;
+  }
+  const peek = slot.peek;
+  peek.fill(0);
+  for (let i = 0; i < used; i++) {
+    const symbol = symbols[i];
+    const len = lengths[offset + symbol];
+    const canonical = nextCode[len];
+    nextCode[len] += 1;
+    if (len > INFLATE_PEEK_BITS) continue;
+    const base = inflateReverseBits(canonical, len);
+    const entry = (symbol | (len << 16)) >>> 0;
+    const step = 1 << len;
+    for (let idx = base; idx < peek.length; idx += step) peek[idx] = entry;
+  }
+  return { counts, symbols, peek, empty: false };
+}
+
+const INFLATE_FIXED_LIT = ((): InflateTable => {
+  const lengths = new Int32Array(288);
+  for (let i = 0; i < 144; i++) lengths[i] = 8;
+  for (let i = 144; i < 256; i++) lengths[i] = 9;
+  for (let i = 256; i < 280; i++) lengths[i] = 7;
+  for (let i = 280; i < 288; i++) lengths[i] = 8;
+  return inflateBuildTable(lengths, 0, 288, newInflateSlot());
+})();
+const INFLATE_FIXED_DIST = ((): InflateTable => {
+  const lengths = new Int32Array(32);
+  lengths.fill(5);
+  return inflateBuildTable(lengths, 0, 32, newInflateSlot());
+})();
+
+/**
+ * Inflate the zlib stream starting at `start` in `buffer`; `sizeHint` is the pack header's
+ * declared uncompressed size (initial capacity only — the output grows past a lying hint,
+ * exactly as the stream path ignores the declared size). Returns the data and the offset
+ * just past the stream's adler32.
+ */
+export function inflateJs(buffer: Buffer, start: number, sizeHint = 0): { data: Buffer; next: number } {
+  if (start + 2 > buffer.length) throw new Error('inflate: input too short');
+  const cmf = buffer[start];
+  const flg = buffer[start + 1];
+  if ((cmf & 0x0f) !== 8) throw new Error('inflate: bad compression method');
+  if (((cmf << 8) + flg) % 31 !== 0) throw new Error('inflate: bad zlib header check');
+  if (flg & 0x20) throw new Error('inflate: preset dictionary unsupported');
+
+  const buf = buffer;
+  const bufLen = buf.length;
+  let pos = start + 2; // next byte to load into the bit buffer
+  let bitBuf = 0;
+  let bitCnt = 0;
+
+  const bits = (n: number): number => {
+    while (bitCnt < n) {
+      if (pos >= bufLen) throw new Error('inflate: input overrun');
+      bitBuf |= buf[pos] << bitCnt;
+      pos += 1;
+      bitCnt += 8;
+    }
+    const value = bitBuf & ((1 << n) - 1);
+    bitBuf >>>= n;
+    bitCnt -= n;
+    return value;
+  };
+
+  const decode = (table: InflateTable): number => {
+    // Fast path: peek INFLATE_PEEK_BITS and resolve any short code in one lookup.
+    if (table.peek.length !== 0) {
+      while (bitCnt < INFLATE_PEEK_BITS && pos < bufLen) {
+        bitBuf |= buf[pos] << bitCnt;
+        pos += 1;
+        bitCnt += 8;
+      }
+      if (bitCnt >= INFLATE_PEEK_BITS || (bitCnt > 0 && pos >= bufLen)) {
+        const entry = table.peek[bitBuf & ((1 << INFLATE_PEEK_BITS) - 1)];
+        const len = entry >>> 16;
+        if (len !== 0 && len <= bitCnt) {
+          bitBuf >>>= len;
+          bitCnt -= len;
+          return entry & 0xffff;
+        }
+      }
+    }
+    const { counts, symbols } = table;
+    let code = 0;
+    let first = 0;
+    let index = 0;
+    for (let len = 1; len < 16; len++) {
+      if (bitCnt === 0) {
+        if (pos >= bufLen) throw new Error('inflate: input overrun');
+        bitBuf = buf[pos];
+        pos += 1;
+        bitCnt = 8;
+      }
+      code |= bitBuf & 1;
+      bitBuf >>>= 1;
+      bitCnt -= 1;
+      const count = counts[len];
+      if (code - first < count) return symbols[index + (code - first)];
+      index += count;
+      first = (first + count) << 1;
+      code <<= 1;
+    }
+    throw new Error('inflate: invalid huffman code');
+  };
+
+  const readDynamicTables = (): { lit: InflateTable; dist: InflateTable } => {
+    const hlit = bits(5) + 257;
+    const hdist = bits(5) + 1;
+    const hclen = bits(4) + 4;
+    const clLengths = INFLATE_CL_LENGTHS;
+    clLengths.fill(0);
+    for (let i = 0; i < hclen; i++) clLengths[INFLATE_CLEN_ORDER[i]] = bits(3);
+    const clTable = inflateBuildTable(clLengths, 0, 19, INFLATE_SLOT_A);
+    const lengths = INFLATE_LENGTHS;
+    lengths.fill(0); // zero-run codes (17/18) skip entries: they must read as 0, not stale scratch
+    let i = 0;
+    while (i < hlit + hdist) {
+      const sym = decode(clTable);
+      if (sym < 16) {
+        lengths[i] = sym;
+        i += 1;
+      } else if (sym === 16) {
+        if (i === 0) throw new Error('inflate: repeat with no previous length');
+        const prev = lengths[i - 1];
+        let rep = 3 + bits(2);
+        while (rep > 0) { lengths[i] = prev; i += 1; rep -= 1; }
+      } else if (sym === 17) {
+        i += 3 + bits(3);
+      } else {
+        i += 11 + bits(7);
+      }
+      if (i > hlit + hdist) throw new Error('inflate: code lengths overrun');
+    }
+    return { lit: inflateBuildTable(lengths, 0, hlit, INFLATE_SLOT_A), dist: inflateBuildTable(lengths, hlit, hdist, INFLATE_SLOT_B) };
+  };
+
+  let out = new Uint8Array(Math.max(64, sizeHint));
+  let outLen = 0;
+  const grow = (extra: number): void => {
+    let cap = out.length * 2;
+    while (cap < outLen + extra) cap *= 2;
+    const next = new Uint8Array(cap);
+    next.set(out.subarray(0, outLen));
+    out = next;
+  };
+
+  for (;;) {
+    const bfinal = bits(1);
+    const btype = bits(2);
+    if (btype === 0) {
+      const drop = bitCnt & 7;
+      bitBuf >>>= drop;
+      bitCnt -= drop;
+      const len = bits(8) | (bits(8) << 8);
+      const nlen = bits(8) | (bits(8) << 8);
+      if (len !== (~nlen & 0xffff)) throw new Error('inflate: stored block length mismatch');
+      if (outLen + len > out.length) grow(len);
+      for (let k = 0; k < len; k++) {
+        out[outLen] = bits(8);
+        outLen += 1;
+      }
+    } else if (btype === 1 || btype === 2) {
+      const { lit, dist } = btype === 1 ? { lit: INFLATE_FIXED_LIT, dist: INFLATE_FIXED_DIST } : readDynamicTables();
+      if (lit.empty) throw new Error('inflate: empty literal table');
+      for (;;) {
+        const sym = decode(lit);
+        if (sym < 256) {
+          if (outLen === out.length) grow(1);
+          out[outLen] = sym;
+          outLen += 1;
+        } else if (sym === 256) {
+          break;
+        } else {
+          const li = sym - 257;
+          if (li >= 29) throw new Error('inflate: bad length symbol');
+          const length = INFLATE_LEN_BASE[li] + bits(INFLATE_LEN_EXTRA[li]);
+          if (dist.empty) throw new Error('inflate: empty distance table');
+          const dsym = decode(dist);
+          if (dsym >= 30) throw new Error('inflate: bad distance symbol');
+          const distance = INFLATE_DIST_BASE[dsym] + bits(INFLATE_DIST_EXTRA[dsym]);
+          if (distance > outLen) throw new Error('inflate: distance too far back');
+          if (outLen + length > out.length) grow(length);
+          let from = outLen - distance;
+          for (let k = 0; k < length; k++) {
+            out[outLen] = out[from];
+            outLen += 1;
+            from += 1;
+          }
+        }
+      }
+    } else {
+      throw new Error('inflate: invalid block type');
+    }
+    if (bfinal === 1) break;
+  }
+
+  const dataEnd = pos - (bitCnt >> 3);
+  if (dataEnd + 4 > bufLen) throw new Error('inflate: missing adler32');
+  const expectedAdler = buf.readUInt32BE(dataEnd);
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < outLen; i++) {
+    a += out[i];
+    b += a;
+    if (b >= 0x10000000) { a %= 65521; b %= 65521; }
+  }
+  const adler = (((b % 65521) << 16) | (a % 65521)) >>> 0;
+  if (adler !== expectedAdler) throw new Error('inflate: adler32 mismatch');
+  return { data: Buffer.from(out.buffer as ArrayBuffer, 0, outLen), next: dataEnd + 4 };
+}
+
+/** Packs up to this size, and objects up to this size, inflate through inflateJs. */
+const JS_INFLATE_MAX_PACK = 65_536;
+const JS_INFLATE_MAX_OBJECT = 262_144;
+
+function inflateObject(pack: Buffer, start: number, size: number): Promise<{ data: Buffer; next: number }> {
+  if (pack.length <= JS_INFLATE_MAX_PACK && size <= JS_INFLATE_MAX_OBJECT) {
+    try {
+      return Promise.resolve(inflateJs(pack, start, size));
+    } catch {
+      // Same error surface as the stream path: any corrupt object is 'corrupt pack object'.
+      throw new Error('corrupt pack object');
+    }
+  }
+  return inflateStream(pack, start);
+}
+
 /** Apply a git delta to a base object. */
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let at = 0;
@@ -222,9 +545,13 @@ export async function readPack(repo: Repo, pack: Buffer): Promise<PackEntry[]> {
     let byte = pack[offset];
     offset += 1;
     const typeNum = (byte >> 4) & 0x07;
+    let size = byte & 0x0f;
+    let sizeShift = 4;
     while (byte & 0x80) {
       byte = pack[offset];
       offset += 1;
+      size += (byte & 0x7f) * 2 ** sizeShift;
+      sizeShift += 7;
     }
     if (typeNum === 6) {
       // OFS_DELTA: a negative offset from this object's header to the base object's header.
@@ -237,21 +564,21 @@ export async function readPack(repo: Repo, pack: Buffer): Promise<PackEntry[]> {
         baseOffset = ((baseOffset + 1) << 7) | (back & 0x7f);
       }
       const baseIndex = indexByHeaderOffset.get(headerAt - baseOffset);
-      const { data, next } = await inflateStream(pack, offset);
+      const { data, next } = await inflateObject(pack, offset, size);
       offset = next;
       entries.push(null);
       pending.push({ slot: index, baseIndex, delta: data });
     } else if (typeNum === 7) {
       const baseOid = pack.toString('hex', offset, offset + 20);
       offset += 20;
-      const { data, next } = await inflateStream(pack, offset);
+      const { data, next } = await inflateObject(pack, offset, size);
       offset = next;
       entries.push(null);
       pending.push({ slot: index, baseOid, delta: data });
     } else {
       const type = OBJ_TYPE_NAME[typeNum];
       if (type === undefined) throw new Error(`pack object type ${typeNum}`);
-      const { data, next } = await inflateStream(pack, offset);
+      const { data, next } = await inflateObject(pack, offset, size);
       offset = next;
       const entry = { type, data, oid: hashObject(type, data) };
       entries.push(entry);
